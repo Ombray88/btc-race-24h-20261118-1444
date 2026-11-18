@@ -117,8 +117,9 @@ await runBars({
 
         const dipBps = (close * BPS) / maxHigh30 - BPS;
         const bounceBps = (close * BPS) / minLow10 - BPS;
+        const freefallBps = (close * BPS) / botState.closes[botState.closes.length - 61] - BPS;
 
-        if (dipBps <= DIP_THRESHOLD_BPS && bounceBps >= BOUNCE_THRESHOLD_BPS) {
+        if (dipBps <= DIP_THRESHOLD_BPS && bounceBps >= BOUNCE_THRESHOLD_BPS && freefallBps > -200n) {
           let size = state.cash / 2n;
           const maxWeight = (state.equity * BigInt(state.hello.caps.max_weight_bps)) / BPS;
           if (size > maxWeight) size = maxWeight;

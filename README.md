@@ -4,7 +4,7 @@
 
 # DipBounce-50 Trading Bot
 
-DipBounce-50 is a mean-reversion strategy for CBBTC. It enters a position when the price has dipped at least 40 bps from its 30-bar high and shows a bounce of at least 5 bps from its 10-bar low. The bot allocates 50% of available cash to each trade, subject to weight limits and minimum notional requirements. It exits positions when reaching a +100 bps gain, a -30 bps loss, or after a maximum holding period of 600 bars. A 30-bar cooldown is applied after each sell to prevent over-trading in volatile conditions.
+DipBounce-50 is a mean-reversion strategy for CBBTC. It enters a position when the price has dipped at least 40 bps from its 30-bar high and shows a bounce of at least 5 bps from its 10-bar low. The bot allocates 50% of available cash to each trade, subject to weight limits and minimum notional requirements. It exits positions when reaching a +100 bps gain, a -30 bps loss, or after a maximum holding period of 600 bars. A 30-bar cooldown is applied after each sell to prevent over-trading in volatile conditions. Entries are skipped in a freefall (60-bar return at or below -200 bps).
 
 ## How to Run
 
