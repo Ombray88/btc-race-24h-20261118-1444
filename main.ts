@@ -1,67 +1,55 @@
-import { runBars, BPS, type OrderInput, type Fill } from './vendor/makefun-bars.ts';
+/**
+ * DipBounce-50: CBBTC mean-reversion strategy.
+ * Entry: dip -40 bps vs 30-bar high, bounce +5 bps vs 10-bar low, skip if 60-bar freefall <= -200 bps.
+ * Size: 50% cash, capped by max weight. Exit: +100/-30 bps or 600 bars. 30-bar cooldown.
+ */
+import { runBars, type Batch, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const WARMUP_MIN_BARS = 120;
-const DIP_WINDOW = 30;
-const BOUNCE_WINDOW = 10;
-const EXIT_GAIN_BPS = 100n;
-const EXIT_LOSS_BPS = -30n;
-const EXIT_MAX_BARS = 600;
-const COOLDOWN_BARS = 30;
-const DIP_THRESHOLD_BPS = -40n;
-const BOUNCE_THRESHOLD_BPS = 5n;
 
-interface State {
+interface BotState {
   closes: bigint[];
   highs: bigint[];
   lows: bigint[];
   entryPrice: bigint | null;
   entrySeq: number | null;
+  buyNotional: bigint | null;
   lastSellSeq: number | null;
-  pendingSell: boolean;
-  buyNotional: bigint;
   realizedPnL: bigint;
+  pendingSell: boolean;
 }
 
-const botState: State = {
+const botState: BotState = {
   closes: [],
   highs: [],
   lows: [],
   entryPrice: null,
   entrySeq: null,
+  buyNotional: null,
   lastSellSeq: null,
-  pendingSell: false,
-  buyNotional: 0n,
   realizedPnL: 0n,
+  pendingSell: false,
 };
 
-await runBars({
-  onBatch(state, batch) {
-    // 1. Process Fills
-    for (const fill of batch.fills) {
-      if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
-      if (fill.side === 'buy') {
-        botState.entryPrice = BigInt(fill.price);
-        botState.entrySeq = fill.decided_bar; // Use decided_bar or batch.seq? Prompt says entrySeq = batch.seq
-        botState.buyNotional = BigInt(fill.notional_quote_units);
-      } else {
-        if (botState.entryPrice !== null) {
-          const sellNotional = BigInt(fill.notional_quote_units);
-          botState.realizedPnL += (sellNotional - botState.buyNotional);
-        }
-        botState.entryPrice = null;
-        botState.entrySeq = null;
-        botState.lastSellSeq = batch.seq;
-        botState.pendingSell = false;
-      }
-    }
+function max(arr: bigint[]): bigint {
+  let m = arr[0];
+  for (let i = 1; i < arr.length; i++) if (arr[i] > m) m = arr[i];
+  return m;
+}
 
-    // 2. Track History
-    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-    if (bar) {
-      botState.closes.push(BigInt(bar.c));
-      botState.highs.push(BigInt(bar.h));
-      botState.lows.push(BigInt(bar.l));
+function min(arr: bigint[]): bigint {
+  let m = arr[0];
+  for (let i = 1; i < arr.length; i++) if (arr[i] < m) m = arr[i];
+  return m;
+}
+
+await runBars({
+  onBatch(state: BarsState, batch: Batch): OrderInput[] {
+    const cbbtcBar = batch.bars.find(b => b.symbol === SYMBOL);
+    if (cbbtcBar) {
+      botState.closes.push(BigInt(cbbtcBar.c));
+      botState.highs.push(BigInt(cbbtcBar.h));
+      botState.lows.push(BigInt(cbbtcBar.l));
     } else {
       const lastClose = state.close(SYMBOL);
       if (lastClose !== null) {
@@ -71,71 +59,76 @@ await runBars({
       }
     }
 
-    // Keep history manageable if needed, but the prompt doesn't specify a limit other than what windows need
-    if (botState.closes.length > 1000) {
-      botState.closes.shift();
-      botState.highs.shift();
-      botState.lows.shift();
-    }
-
-    if (state.warmingUp || botState.closes.length < WARMUP_MIN_BARS) {
-      return [];
-    }
-
-    const close = botState.closes[botState.closes.length - 1];
-    const orders: OrderInput[] = [];
-
-    // 3. Exit Logic
-    if (botState.entryPrice !== null) {
-      const gainBps = (close * BPS) / botState.entryPrice - BPS;
-      const barsHeld = batch.seq - (botState.entrySeq ?? 0);
-      const shouldExit = gainBps >= EXIT_GAIN_BPS || gainBps <= EXIT_LOSS_BPS || barsHeld >= EXIT_MAX_BARS;
-
-      if (shouldExit || botState.pendingSell) {
-        const pos = state.positions.get(SYMBOL);
-        if (pos && pos.qty > 0n) {
-          orders.push({
-            side: 'sell',
-            symbol: SYMBOL,
-            qty: pos.qty,
-            max_slippage_bps: 100,
-          });
-          botState.pendingSell = true;
+    for (const fill of batch.fills) {
+      if (fill.symbol !== SYMBOL) continue;
+      if (fill.status === 'filled') {
+        if (fill.side === 'buy') {
+          botState.entryPrice = BigInt(fill.price);
+          botState.entrySeq = fill.decided_bar;
+          botState.buyNotional = BigInt(fill.notional_quote_units);
         } else {
-          // If we thought we held but state says otherwise, reset
+          const sellNotional = BigInt(fill.notional_quote_units);
+          if (botState.buyNotional !== null) {
+            botState.realizedPnL += (sellNotional - botState.buyNotional);
+          }
+          botState.entryPrice = null;
+          botState.entrySeq = null;
+          botState.buyNotional = null;
+          botState.lastSellSeq = batch.seq;
+          botState.pendingSell = false;
+        }
+      } else if (fill.status === 'rejected') {
+        if (fill.side === 'sell') {
           botState.pendingSell = false;
         }
       }
     }
 
-    // 4. Entry Logic
-    if (botState.entryPrice === null && !botState.pendingSell) {
-      const cooldownPassed = botState.lastSellSeq === null || (batch.seq - botState.lastSellSeq) >= COOLDOWN_BARS;
-      if (cooldownPassed) {
-        const maxHigh30 = botState.highs.slice(-DIP_WINDOW).reduce((a, b) => (a > b ? a : b));
-        const minLow10 = botState.lows.slice(-BOUNCE_WINDOW).reduce((a, b) => (a < b ? a : b));
+    if (state.warmingUp || botState.closes.length < 120) return [];
 
-        const dipBps = (close * BPS) / maxHigh30 - BPS;
-        const bounceBps = (close * BPS) / minLow10 - BPS;
-        const freefallBps = (close * BPS) / botState.closes[botState.closes.length - 61] - BPS;
+    const close = botState.closes[botState.closes.length - 1];
+    const orders: OrderInput[] = [];
 
-        if (dipBps <= DIP_THRESHOLD_BPS && bounceBps >= BOUNCE_THRESHOLD_BPS && freefallBps > -200n) {
-          let size = state.cash / 2n;
-          const maxWeight = (state.equity * BigInt(state.hello.caps.max_weight_bps)) / BPS;
-          if (size > maxWeight) size = maxWeight;
+    if (botState.entryPrice === null) {
+      const maxHigh30 = max(botState.highs.slice(-30));
+      const minLow10 = min(botState.lows.slice(-10));
+      const dipBps = (close * 10000n) / maxHigh30 - 10000n;
+      const bounceBps = (close * 10000n) / minLow10 - 10000n;
+      
+      let freefallBps: bigint | null = null;
+      if (botState.closes.length >= 61) {
+        const close60 = botState.closes[botState.closes.length - 61];
+        freefallBps = (close * 10000n) / close60 - 10000n;
+      }
 
-          if (size >= BigInt(state.hello.fees.min_notional_quote_units)) {
-            orders.push({
-              side: 'buy',
-              symbol: SYMBOL,
-              notional_quote_units: size,
-              max_slippage_bps: 100,
-            });
-          }
+      const cooldownMet = botState.lastSellSeq === null || (batch.seq - botState.lastSellSeq) >= 30;
+      const entrySignal = dipBps <= -40n && bounceBps >= 5n && (freefallBps === null || freefallBps > -200n);
+
+      if (entrySignal && cooldownMet) {
+        let size = state.cash / 2n;
+        const room = state.weightRoom(SYMBOL);
+        if (size > room) size = room;
+        
+        if (size >= BigInt(state.hello.fees.min_notional_quote_units)) {
+          orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: 100 });
+        }
+      }
+    } else {
+      const gainBps = (close * 10000n) / botState.entryPrice - 10000n;
+      const barsHeld = batch.seq - botState.entrySeq!;
+      const exitReason = gainBps >= 100n || gainBps <= -30n || barsHeld >= 600;
+
+      if (exitReason || botState.pendingSell) {
+        const pos = state.positions.get(SYMBOL);
+        if (pos && pos.qty > 0n) {
+          botState.pendingSell = true;
+          orders.push({ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: 100 });
+        } else {
+          botState.pendingSell = false;
         }
       }
     }
 
     return orders;
-  },
+  }
 });
