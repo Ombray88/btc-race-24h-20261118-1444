@@ -17,6 +17,8 @@ interface BotState {
   lastSellSeq: number | null;
   realizedPnL: bigint;
   pendingSell: boolean;
+  peakEquity: bigint;
+  stopped: boolean;
 }
 
 const botState: BotState = {
@@ -29,6 +31,8 @@ const botState: BotState = {
   lastSellSeq: null,
   realizedPnL: 0n,
   pendingSell: false,
+  peakEquity: 0n,
+  stopped: false,
 };
 
 function max(arr: bigint[]): bigint {
@@ -45,6 +49,10 @@ function min(arr: bigint[]): bigint {
 
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
+    if (state.equity > botState.peakEquity) botState.peakEquity = state.equity;
+    const drawdownBps = botState.peakEquity > 0n ? (botState.peakEquity - state.equity) * 10000n / botState.peakEquity : 0n;
+    if (drawdownBps > 500n) botState.stopped = true;
+
     const cbbtcBar = batch.bars.find(b => b.symbol === SYMBOL);
     if (cbbtcBar) {
       botState.closes.push(BigInt(cbbtcBar.c));
@@ -102,7 +110,7 @@ await runBars({
       }
 
       const cooldownMet = botState.lastSellSeq === null || (batch.seq - botState.lastSellSeq) >= 30;
-      const entrySignal = dipBps <= -40n && bounceBps >= 5n && (freefallBps === null || freefallBps > -200n);
+      const entrySignal = dipBps <= -40n && bounceBps >= 5n && (freefallBps === null || freefallBps > -200n) && !botState.stopped;
 
       if (entrySignal && cooldownMet) {
         let size = state.cash / 2n;
